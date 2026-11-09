@@ -1,0 +1,19 @@
+# Secrets & environment
+.env
+.env.*
+!.env.example
+
+# Runtime state & temporary git workspaces
+data/
+temp_workspace/
+temp_eval/
+temp_portfolio/
+
+# Python caches & virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+
