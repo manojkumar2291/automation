@@ -1,4 +1,4 @@
-"""Pydantic models for webhook payloads, LangChain structured output, and portfolio items."""
+"""Pydantic schemas for README-based project analysis, portfolio items, LinkedIn posts, and briefs."""
 
 from __future__ import annotations
 
@@ -27,46 +27,52 @@ def strip_ats_markdown(bullet: str) -> str:
     return text
 
 
-class WebhookRepositoryInfo(BaseModel):
-    """Subset of native GitHub push webhook `repository` object."""
+def clean_linkedin_plain_text(text: str) -> str:
+    """Remove Markdown asterisks/backticks that render literally on LinkedIn while preserving line breaks."""
+    cleaned = text.strip()
+    cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"__(.+?)__", r"\1", cleaned)
+    cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+    # Replace leading markdown `- ` list items with clean `• ` bullets
+    cleaned = re.sub(r"(?m)^-\s+", "• ", cleaned)
+    return cleaned.strip()
 
-    clone_url: Optional[str] = None
-    html_url: Optional[str] = None
-    private: Optional[bool] = None
-    homepage: Optional[str] = None
-    default_branch: Optional[str] = None
 
+class AnalyzeRequest(BaseModel):
+    """Input payload for `POST /analyze` supporting README text, local path, or GitHub URL."""
 
-class WebhookPayload(BaseModel):
-    """Supports both lightweight workflow pings and native GitHub push webhooks."""
-
-    repo_url: Optional[str] = None
-    commit_sha: Optional[str] = "HEAD"
-    branch: Optional[str] = None
-    is_private: Optional[bool] = None
-    live_demo_link: Optional[str] = None
-
-    after: Optional[str] = None
-    ref: Optional[str] = None
-    repository: Optional[WebhookRepositoryInfo] = None
-
-    def resolved_repo_url(self) -> str:
-        url = self.repo_url
-        if not url and self.repository:
-            url = self.repository.html_url or self.repository.clone_url
-        if not url:
-            raise ValueError("Payload must include `repo_url` or `repository.html_url`.")
-        return url.strip()
-
-    def resolved_commit_sha(self) -> str:
-        sha = self.commit_sha
-        if (not sha or sha == "HEAD") and self.after:
-            if set(self.after) != {"0"}:
-                sha = self.after
-        return (sha or "HEAD").strip()
-
-    def is_branch_deletion(self) -> bool:
-        return bool(self.after and set(self.after) == {"0"})
+    readme_content: Optional[str] = Field(
+        default=None,
+        description="Raw Markdown text of the completed project's README.md.",
+    )
+    readme_path: Optional[str] = Field(
+        default=None,
+        description="Local path to a README.md file on disk (when calling local server).",
+    )
+    repo_url: Optional[str] = Field(
+        default=None,
+        description="Optional GitHub repo URL (fetches README.md via API if readme_content/path omitted).",
+    )
+    project_name_hint: Optional[str] = Field(
+        default=None,
+        description="Optional explicit project title override.",
+    )
+    live_demo_link: Optional[str] = Field(
+        default=None,
+        description="Optional live deployment URL (e.g. Vercel / Netlify link).",
+    )
+    is_private: Optional[bool] = Field(
+        default=None,
+        description="Set true for private/client projects so source_code_link stays omitted.",
+    )
+    update_portfolio: bool = Field(
+        default=True,
+        description="Whether to commit & push the project update to PORTFOLIO_REPO_URL.",
+    )
+    post_to_linkedin: bool = Field(
+        default=True,
+        description="Whether to publish the generated launch post via LINKEDIN_ACCESS_TOKEN.",
+    )
 
 
 class WorkflowStep(BaseModel):
@@ -82,7 +88,7 @@ class DetailSection(BaseModel):
     """Deep-dive engineering section inside `project.details` in the React portfolio."""
 
     title: str = Field(
-        description="Section heading such as 'Engineering decisions', 'Testing approach', or 'Current scope'."
+        description="Section heading: 'Engineering decisions', 'Testing approach', or 'Current scope'."
     )
     description: Optional[str] = Field(
         default=None,
@@ -90,26 +96,12 @@ class DetailSection(BaseModel):
     )
     items: list[str] = Field(
         default_factory=list,
-        description="2 to 4 concrete technical observations grounded in the codebase.",
+        description="2 to 4 concrete technical points grounded in the README.",
     )
 
 
 class LLMEvaluationSchema(BaseModel):
-    """Schema bound directly to LangChain `llm.with_structured_output(...)`."""
-
-    is_high_impact: bool = Field(
-        description="True only when the commit/project reflects substantive engineering work rather than trivial edits."
-    )
-    impact_score: int = Field(
-        default=5,
-        ge=1,
-        le=10,
-        description="Engineering impact score from 1 (trivial typo) to 10 (major system architecture).",
-    )
-    impact_reason: str = Field(
-        default="",
-        description="Concise 1-sentence justification of why this commit is or is not high-impact.",
-    )
+    """Structured schema bound directly to `ChatOllama.with_structured_output(...)`."""
 
     id: str = Field(
         default="project",
@@ -133,8 +125,8 @@ class LLMEvaluationSchema(BaseModel):
     )
     featured: bool = Field(default=True, description="Whether to feature the project on the home view.")
     status: str = Field(
-        default="Active development",
-        description="Maturity label such as 'Production', 'Active development', 'Local prototype', or 'Open source'.",
+        default="Completed",
+        description="Maturity label such as 'Production', 'Live prototype', 'Local prototype', or 'Open source'.",
     )
     icon: str = Field(
         default="workflow",
@@ -150,7 +142,7 @@ class LLMEvaluationSchema(BaseModel):
     )
     tech_stack: list[str] = Field(
         default_factory=list,
-        description="Concrete programming languages, frameworks, and tools actually used in the repository.",
+        description="Concrete programming languages, frameworks, and tools mentioned in the README.",
     )
     highlights: list[str] = Field(
         default_factory=list,
@@ -158,19 +150,31 @@ class LLMEvaluationSchema(BaseModel):
     )
     workflow: list[WorkflowStep] = Field(
         default_factory=list,
-        description="3 to 4 ordered architectural workflow steps explaining system execution.",
+        description="3 to 4 ordered architectural workflow steps explaining how the project works.",
     )
     details: list[DetailSection] = Field(
         default_factory=list,
-        description="Deep-dive sections covering 'Engineering decisions', 'Testing approach', and 'Current scope'.",
+        description="2 to 3 deep-dive sections ('Engineering decisions', 'Testing approach', 'Current scope').",
     )
     flowcv_format: list[str] = Field(
         default_factory=list,
-        description="3 to 5 plain-text ATS action-verb resume bullets (NO markdown bolding or leading bullet symbols).",
+        description="3 to 5 plain-text ATS action-verb resume bullets for FlowCV (NO markdown bolding or leading bullets).",
     )
     linkedin_profile: str = Field(
         default="",
-        description="1st-person professional narrative block (4-6 sentences) showcasing systems engineering choices.",
+        description="1st-person professional narrative block (4-6 sentences) for LinkedIn's Profile Projects section.",
+    )
+    linkedin_post: str = Field(
+        default="",
+        description=(
+            "Engaging 1st-person LinkedIn feed launch post (120-220 words): strong opening hook, "
+            "problem solved, 3-4 bulleted engineering highlights using '•', tech stack line, and "
+            "3-5 relevant hashtags. Plain Unicode text ONLY (no **bold** markdown)."
+        ),
+    )
+    executive_brief: str = Field(
+        default="",
+        description="Concise 2-3 sentence summary explaining what was extracted and how the project was positioned.",
     )
 
     @field_validator("id", mode="before")
@@ -211,6 +215,11 @@ class LLMEvaluationSchema(BaseModel):
             return [item for item in cleaned if item]
         return []
 
+    @field_validator("linkedin_profile", "linkedin_post", mode="before")
+    @classmethod
+    def _sanitize_linkedin_text(cls, value: Any) -> str:
+        return clean_linkedin_plain_text(str(value or ""))
+
     @field_validator("categories", mode="before")
     @classmethod
     def _ensure_categories(cls, value: Any) -> list[str]:
@@ -223,13 +232,16 @@ class LLMEvaluationSchema(BaseModel):
 
 
 class EvaluationResult(LLMEvaluationSchema):
-    """Complete evaluation artifact combining LLM structured output + git metadata."""
+    """Complete generated artifact persisted to `data/latest_generation.json`."""
 
+    is_high_impact: bool = True
+    impact_score: int = 10
     repo_url: Optional[str] = None
-    commit_sha: Optional[str] = None
     source_code_link: Optional[str] = None
     live_demo_link: Optional[str] = None
     evaluated_at: Optional[str] = None
+    linkedin_post_url: Optional[str] = None
+    portfolio_status: Optional[str] = None
 
     def to_portfolio_dict(self) -> dict[str, Any]:
         """Build the structured dictionary matching the user's React `projects.js` catalog."""
@@ -266,3 +278,15 @@ class EvaluationResult(LLMEvaluationSchema):
         if self.live_demo_link:
             entry["live_demo_link"] = self.live_demo_link
         return entry
+
+
+class AnalyzeResponse(BaseModel):
+    """Synchronous response returned by `/analyze` with action statuses + brief."""
+
+    status: str = "completed"
+    project_id: str
+    project_name: str
+    actions: dict[str, dict[str, Any]]
+    brief_markdown: str
+    brief_file: str
+    evaluation: EvaluationResult

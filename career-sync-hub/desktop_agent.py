@@ -20,10 +20,12 @@ from urllib.request import Request, urlopen
 import webbrowser
 
 from config import Settings
-from models import strip_ats_markdown
+from linkedin_publisher import compose_linkedin_post_body
+from models import EvaluationResult, strip_ats_markdown
 
 FLOWCV_URL = "https://app.flowcv.com/resumes"
 LINKEDIN_PROJECTS_URL = "https://www.linkedin.com/in/me/"
+LINKEDIN_FEED_URL = "https://www.linkedin.com/feed/"
 
 
 def get_paste_hotkey() -> tuple[str, str]:
@@ -343,7 +345,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--linkedin",
         action="store_true",
-        help="Paste 1st-person engineering narrative & stack into LinkedIn.",
+        help="Paste 1st-person engineering narrative & stack into LinkedIn Profile -> Projects.",
+    )
+    parser.add_argument(
+        "--linkedin-post",
+        action="store_true",
+        help="Fallback manual paste for LinkedIn Feed launch post (if not using LINKEDIN_ACCESS_TOKEN).",
     )
     parser.add_argument(
         "--step",
@@ -415,8 +422,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             print_history_table(records)
             return 0
 
-        if not args.flowcv and not args.linkedin:
-            parser.error("Specify at least one target channel: `--flowcv` and/or `--linkedin` (or `--list`).")
+        if not args.flowcv and not args.linkedin and not args.linkedin_post:
+            parser.error(
+                "Specify at least one target: `--flowcv`, `--linkedin`, or `--linkedin-post` (or `--list`)."
+            )
 
         data = load_generation_payload(
             settings=settings,
@@ -466,6 +475,23 @@ def main(argv: Optional[list[str]] = None) -> int:
                     delay_seconds=args.delay,
                     dry_run=args.dry_run,
                 )
+
+        if args.linkedin_post:
+            if (args.flowcv or args.linkedin) and not args.dry_run:
+                input("\nPress [Enter] when ready to paste your LinkedIn Feed Post...")
+
+            if not args.no_browser and not args.dry_run:
+                print(f"Opening LinkedIn Feed in default browser ({LINKEDIN_FEED_URL})...")
+                webbrowser.open(LINKEDIN_FEED_URL, new=2)
+
+            eval_obj = EvaluationResult.model_validate(data)
+            post_text = compose_linkedin_post_body(eval_obj)
+            countdown_and_paste(
+                post_text,
+                label=f"LinkedIn Feed Launch Post — {project_title}",
+                delay_seconds=args.delay,
+                dry_run=args.dry_run,
+            )
 
         return 0
 

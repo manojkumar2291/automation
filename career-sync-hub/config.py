@@ -1,7 +1,7 @@
-"""Centralized configuration for career-sync-hub.
+"""Centralized configuration for career-sync-hub (README-driven release pipeline).
 
-Configured local-first for `ChatOllama` (`langchain-ollama`) with zero API keys
-required, plus optional Google Gemini (`ChatGoogleGenerativeAI`) support via `.env`.
+Configured local-first for `ChatOllama` (`langchain-ollama`), automated GitHub
+React portfolio commits, and automated LinkedIn Feed posting via `LINKEDIN_ACCESS_TOKEN`.
 """
 
 from __future__ import annotations
@@ -9,14 +9,38 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
-# Load `career-sync-hub/.env` first, falling back to parent `automation/.env` if placed there
-if (BASE_DIR / ".env").is_file():
-    load_dotenv(BASE_DIR / ".env")
-elif (BASE_DIR.parent / ".env").is_file():
-    load_dotenv(BASE_DIR.parent / ".env")
+_LAST_ENV_MTIME_NS: Optional[int] = None
+
+
+def _sync_dotenv_if_modified() -> None:
+    """Reload `.env` automatically whenever created or edited on disk."""
+    global _LAST_ENV_MTIME_NS
+
+    env_path = BASE_DIR / ".env"
+    if not env_path.is_file() and (BASE_DIR.parent / ".env").is_file():
+        env_path = BASE_DIR.parent / ".env"
+
+    if not env_path.is_file():
+        return
+
+    try:
+        mtime_ns = env_path.stat().st_mtime_ns
+    except OSError:
+        return
+
+    if _LAST_ENV_MTIME_NS is None:
+        load_dotenv(env_path, override=False)
+        _LAST_ENV_MTIME_NS = mtime_ns
+    elif mtime_ns != _LAST_ENV_MTIME_NS:
+        load_dotenv(env_path, override=True)
+        _LAST_ENV_MTIME_NS = mtime_ns
+
+
+_sync_dotenv_if_modified()
 
 
 @dataclass(frozen=True)
@@ -30,7 +54,7 @@ class Settings:
     ollama_num_ctx: int
     llm_temperature: float
 
-    # Optional Gemini configuration (if GEMINI_API_KEY is supplied in .env)
+    # Optional Google Gemini configuration
     gemini_api_key: str
     gemini_model: str
 
@@ -39,9 +63,13 @@ class Settings:
     portfolio_repo_url: str
     portfolio_projects_path: str
     portfolio_branch: str
-
     git_author_name: str
     git_author_email: str
+
+    # Official LinkedIn API configuration (for hands-free LinkedIn feed posts)
+    linkedin_access_token: str
+    linkedin_person_urn: str
+    linkedin_visibility: str
 
     # Security & Desktop CLI sync
     webhook_secret: str
@@ -49,7 +77,7 @@ class Settings:
 
     data_dir: Path
     temp_root_dir: Path
-    max_diff_chars: int = 24_000
+    max_readme_chars: int = 14_000
     max_history_items: int = 30
     allowed_git_hosts: tuple[str, ...] = field(
         default=("github.com", "gitlab.com", "bitbucket.org")
@@ -57,6 +85,8 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        _sync_dotenv_if_modified()
+
         provider = os.environ.get("LLM_PROVIDER", "ollama").strip().lower() or "ollama"
         ollama_model = (
             os.environ.get("OLLAMA_MODEL")
@@ -67,7 +97,13 @@ class Settings:
             os.environ.get("OLLAMA_BASE_URL")
             or os.environ.get("OLLAMA_HOST")
             or "http://localhost:11434"
-        ).strip()
+        ).strip().rstrip("/")
+
+        visibility = (
+            os.environ.get("LINKEDIN_VISIBILITY", "PUBLIC").strip().upper() or "PUBLIC"
+        )
+        if visibility not in {"PUBLIC", "CONNECTIONS"}:
+            visibility = "PUBLIC"
 
         raw_hosts = os.environ.get(
             "ALLOWED_GIT_HOSTS", "github.com,gitlab.com,bitbucket.org"
@@ -81,11 +117,15 @@ class Settings:
             os.environ.get("TEMP_ROOT_DIR", str(BASE_DIR / "temp_workspace"))
         ).resolve()
 
+        webhook_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
+        if webhook_secret == "generate-a-strong-random-32-char-secret":
+            webhook_secret = ""
+
         return cls(
             llm_provider=provider,
             ollama_model=ollama_model,
             ollama_base_url=ollama_base_url,
-            ollama_num_ctx=int(os.environ.get("OLLAMA_NUM_CTX", "16384")),
+            ollama_num_ctx=int(os.environ.get("OLLAMA_NUM_CTX", "4096")),
             llm_temperature=float(os.environ.get("LLM_TEMPERATURE", "0.2")),
             gemini_api_key=(
                 os.environ.get("GEMINI_API_KEY")
@@ -105,11 +145,16 @@ class Settings:
             git_author_email=os.environ.get(
                 "GIT_AUTHOR_EMAIL", "career-sync-hub@users.noreply.github.com"
             ).strip(),
-            webhook_secret=os.environ.get("WEBHOOK_SECRET", "").strip(),
-            hub_server_url=os.environ.get("HUB_SERVER_URL", "").strip().rstrip("/"),
+            linkedin_access_token=os.environ.get("LINKEDIN_ACCESS_TOKEN", "").strip(),
+            linkedin_person_urn=os.environ.get("LINKEDIN_PERSON_URN", "").strip(),
+            linkedin_visibility=visibility,
+            webhook_secret=webhook_secret,
+            hub_server_url=os.environ.get(
+                "HUB_SERVER_URL", "http://localhost:8000"
+            ).strip().rstrip("/"),
             data_dir=data_dir,
             temp_root_dir=temp_root,
-            max_diff_chars=int(os.environ.get("MAX_DIFF_CHARS", "24000")),
+            max_readme_chars=int(os.environ.get("MAX_README_CHARS", "14000")),
             max_history_items=int(os.environ.get("MAX_HISTORY_ITEMS", "30")),
             allowed_git_hosts=allowed_hosts,
         )
