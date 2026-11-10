@@ -1,13 +1,18 @@
-"""Pydantic schemas for README-based project analysis, portfolio items, LinkedIn posts, and briefs."""
+"""Pydantic schemas for README content analysis, portfolio items, resume bullets, and LinkedIn."""
 
 from __future__ import annotations
 
 import re
 from typing import Any, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 VALID_PORTFOLIO_ICONS = {"workflow", "ai", "voice", "health", "crm", "leads"}
+
+
+# ============================================================================
+# Section 1: Text & Slug Sanitizers
+# ============================================================================
 
 
 def slugify_id(value: str) -> str:
@@ -28,42 +33,31 @@ def strip_ats_markdown(bullet: str) -> str:
 
 
 def clean_linkedin_plain_text(text: str) -> str:
-    """Remove Markdown asterisks/backticks that render literally on LinkedIn while preserving line breaks."""
+    """Remove Markdown asterisks/backticks that render literally on LinkedIn while keeping line breaks."""
     cleaned = text.strip()
     cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned)
     cleaned = re.sub(r"__(.+?)__", r"\1", cleaned)
     cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
-    # Replace leading markdown `- ` list items with clean `• ` bullets
     cleaned = re.sub(r"(?m)^-\s+", "• ", cleaned)
     return cleaned.strip()
 
 
-class AnalyzeRequest(BaseModel):
-    """Input payload for `POST /analyze` supporting README text, local path, or GitHub URL."""
+# ============================================================================
+# Section 2: API Request Schema (`README.md` Content Input)
+# ============================================================================
 
-    readme_content: Optional[str] = Field(
-        default=None,
-        description="Raw Markdown text of the completed project's README.md.",
+
+class AnalyzeRequest(BaseModel):
+    """Input payload for `POST /analyze` containing the raw `README.md` content."""
+
+    readme_content: str = Field(
+        ...,
+        min_length=1,
+        description="Full Markdown content of your completed project's README.md.",
     )
-    readme_path: Optional[str] = Field(
-        default=None,
-        description="Local path to a README.md file on disk (when calling local server).",
-    )
-    repo_url: Optional[str] = Field(
-        default=None,
-        description="Optional GitHub repo URL (fetches README.md via API if readme_content/path omitted).",
-    )
-    project_name_hint: Optional[str] = Field(
-        default=None,
-        description="Optional explicit project title override.",
-    )
-    live_demo_link: Optional[str] = Field(
-        default=None,
-        description="Optional live deployment URL (e.g. Vercel / Netlify link).",
-    )
-    is_private: Optional[bool] = Field(
-        default=None,
-        description="Set true for private/client projects so source_code_link stays omitted.",
+    is_private: bool = Field(
+        default=False,
+        description="Set true for private/client projects so source_code_link is omitted.",
     )
     update_portfolio: bool = Field(
         default=True,
@@ -73,6 +67,11 @@ class AnalyzeRequest(BaseModel):
         default=True,
         description="Whether to publish the generated launch post via LINKEDIN_ACCESS_TOKEN.",
     )
+
+
+# ============================================================================
+# Section 3: Structured LLM Output Schema (`ChatOllama`)
+# ============================================================================
 
 
 class WorkflowStep(BaseModel):
@@ -105,11 +104,11 @@ class LLMEvaluationSchema(BaseModel):
 
     id: str = Field(
         default="project",
-        description="Preferred kebab-case slug identifier for the React portfolio route (e.g. 'multi-agent-rag').",
+        description="Clean kebab-case slug identifier for the React portfolio route (e.g. 'multi-agent-rag').",
     )
     project_name: str = Field(
         default="Untitled Project",
-        description="Human-readable project display title.",
+        description="Human-readable project display title extracted from the README.",
     )
     subtitle: str = Field(
         default="",
@@ -230,13 +229,72 @@ class LLMEvaluationSchema(BaseModel):
             return cleaned or ["Full Stack"]
         return ["Full Stack"]
 
+    @model_validator(mode="after")
+    def _enrich_missing_career_fields(self) -> "LLMEvaluationSchema":
+        """Guarantee `flowcv_format`, `linkedin_profile`, and `linkedin_post` are never empty."""
+        stack_preview = ", ".join(self.tech_stack[:5]) if self.tech_stack else "modern backend tools"
+
+        # 1. Guarantee 3-5 ATS action-verb bullets for FlowCV Resume
+        if not self.flowcv_format:
+            synthesized: list[str] = []
+            if self.architecture_summary:
+                summary_clean = strip_ats_markdown(self.architecture_summary)
+                if summary_clean:
+                    first_lower = summary_clean[0].lower() + summary_clean[1:]
+                    synthesized.append(
+                        f"Architected and built {self.project_name} using {stack_preview} — {first_lower}"
+                    )
+            for step in self.workflow[:2]:
+                desc = strip_ats_markdown(step.description).rstrip(".")
+                if desc:
+                    synthesized.append(
+                        f"Engineered {step.title.lower()} pipeline stage: {desc}."
+                    )
+            for hl in self.highlights:
+                if len(synthesized) >= 4:
+                    break
+                hl_clean = strip_ats_markdown(hl).rstrip(".")
+                if hl_clean:
+                    synthesized.append(f"Implemented {hl_clean[0].lower() + hl_clean[1:]}.")
+            self.flowcv_format = synthesized[:5]
+
+        # 2. Guarantee LinkedIn Profile Project narrative
+        if not self.linkedin_profile and self.architecture_summary:
+            hl_sentence = (
+                " Key capabilities include " + "; ".join(self.highlights[:3]) + "."
+                if self.highlights
+                else ""
+            )
+            self.linkedin_profile = clean_linkedin_plain_text(
+                f"I designed and built {self.project_name} ({self.subtitle or self.category}). "
+                f"{self.architecture_summary}{hl_sentence}"
+            )
+
+        # 3. Guarantee LinkedIn Feed Launch Post
+        if not self.linkedin_post and self.architecture_summary:
+            bullet_lines = "\n".join(f"• {strip_ats_markdown(h)}" for h in self.highlights[:4])
+            tags = " ".join(
+                f"#{re.sub(r'[^a-zA-Z0-9]', '', t)}" for t in self.tech_stack[:4] if t
+            )
+            self.linkedin_post = clean_linkedin_plain_text(
+                f"Excited to share my latest project: {self.project_name}!\n\n"
+                f"{self.architecture_summary}\n\n"
+                f"Key Engineering Highlights:\n{bullet_lines}\n\n"
+                f"Tech Stack: {', '.join(self.tech_stack)}\n\n"
+                f"{tags or '#SoftwareEngineering #AI #FullStack'}"
+            )
+
+        return self
+
+
+# ============================================================================
+# Section 4: Persisted Artifact & API Response Models
+# ============================================================================
+
 
 class EvaluationResult(LLMEvaluationSchema):
     """Complete generated artifact persisted to `data/latest_generation.json`."""
 
-    is_high_impact: bool = True
-    impact_score: int = 10
-    repo_url: Optional[str] = None
     source_code_link: Optional[str] = None
     live_demo_link: Optional[str] = None
     evaluated_at: Optional[str] = None

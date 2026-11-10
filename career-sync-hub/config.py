@@ -1,12 +1,11 @@
-"""Centralized configuration for career-sync-hub (README-driven release pipeline).
+"""Configuration loader for Career Sync Hub (`config.py`).
 
-Configured local-first for `ChatOllama` (`langchain-ollama`), automated GitHub
-React portfolio commits, and automated LinkedIn Feed posting via `LINKEDIN_ACCESS_TOKEN`.
+Loads environment variables from `.env` into a clean, typed `Settings` object.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import os
 from pathlib import Path
 from typing import Optional
@@ -16,14 +15,13 @@ BASE_DIR = Path(__file__).resolve().parent
 _LAST_ENV_MTIME_NS: Optional[int] = None
 
 
-def _sync_dotenv_if_modified() -> None:
-    """Reload `.env` automatically whenever created or edited on disk."""
+def _reload_dotenv_if_changed() -> None:
+    """Reload `.env` automatically whenever it is edited on disk."""
     global _LAST_ENV_MTIME_NS
 
     env_path = BASE_DIR / ".env"
     if not env_path.is_file() and (BASE_DIR.parent / ".env").is_file():
         env_path = BASE_DIR.parent / ".env"
-
     if not env_path.is_file():
         return
 
@@ -40,25 +38,20 @@ def _sync_dotenv_if_modified() -> None:
         _LAST_ENV_MTIME_NS = mtime_ns
 
 
-_sync_dotenv_if_modified()
+_reload_dotenv_if_changed()
 
 
 @dataclass(frozen=True)
 class Settings:
-    """Immutable runtime settings loaded from environment variables."""
+    """Application settings loaded from `.env`."""
 
-    # LLM configuration (defaults to local Ollama via LangChain ChatOllama)
-    llm_provider: str
+    # 1. Local Ollama Model Settings
     ollama_model: str
     ollama_base_url: str
     ollama_num_ctx: int
     llm_temperature: float
 
-    # Optional Google Gemini configuration
-    gemini_api_key: str
-    gemini_model: str
-
-    # GitHub & React Portfolio sync
+    # 2. GitHub & React Portfolio Settings
     github_pat: str
     portfolio_repo_url: str
     portfolio_projects_path: str
@@ -66,74 +59,43 @@ class Settings:
     git_author_name: str
     git_author_email: str
 
-    # Official LinkedIn API configuration (for hands-free LinkedIn feed posts)
+    # 3. LinkedIn API Settings
     linkedin_access_token: str
     linkedin_person_urn: str
     linkedin_visibility: str
 
-    # Security & Desktop CLI sync
-    webhook_secret: str
+    # 4. Local Server & Storage Settings
     hub_server_url: str
-
     data_dir: Path
     temp_root_dir: Path
     max_readme_chars: int = 14_000
-    max_history_items: int = 30
-    allowed_git_hosts: tuple[str, ...] = field(
-        default=("github.com", "gitlab.com", "bitbucket.org")
-    )
 
     @classmethod
     def from_env(cls) -> "Settings":
-        _sync_dotenv_if_modified()
+        _reload_dotenv_if_changed()
 
-        provider = os.environ.get("LLM_PROVIDER", "ollama").strip().lower() or "ollama"
-        ollama_model = (
-            os.environ.get("OLLAMA_MODEL")
-            or os.environ.get("LLM_MODEL")
-            or "qwen2.5-coder:7b"
-        ).strip()
-        ollama_base_url = (
-            os.environ.get("OLLAMA_BASE_URL")
-            or os.environ.get("OLLAMA_HOST")
-            or "http://localhost:11434"
-        ).strip().rstrip("/")
+        github_pat = os.environ.get("GITHUB_PAT", "").strip()
+        if github_pat in {"github_pat_replace_me", "ghp_replace_me", "your_github_pat_here"}:
+            github_pat = ""
 
-        visibility = (
-            os.environ.get("LINKEDIN_VISIBILITY", "PUBLIC").strip().upper() or "PUBLIC"
-        )
+        visibility = os.environ.get("LINKEDIN_VISIBILITY", "PUBLIC").strip().upper()
         if visibility not in {"PUBLIC", "CONNECTIONS"}:
             visibility = "PUBLIC"
 
-        raw_hosts = os.environ.get(
-            "ALLOWED_GIT_HOSTS", "github.com,gitlab.com,bitbucket.org"
-        )
-        allowed_hosts = tuple(
-            h.strip().lower() for h in raw_hosts.split(",") if h.strip()
-        )
-
-        data_dir = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "data"))).resolve()
-        temp_root = Path(
-            os.environ.get("TEMP_ROOT_DIR", str(BASE_DIR / "temp_workspace"))
-        ).resolve()
-
-        webhook_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
-        if webhook_secret == "generate-a-strong-random-32-char-secret":
-            webhook_secret = ""
-
         return cls(
-            llm_provider=provider,
-            ollama_model=ollama_model,
-            ollama_base_url=ollama_base_url,
+            ollama_model=(
+                os.environ.get("OLLAMA_MODEL")
+                or os.environ.get("LLM_MODEL")
+                or "qwen2.5-coder:7b"
+            ).strip(),
+            ollama_base_url=(
+                os.environ.get("OLLAMA_BASE_URL")
+                or os.environ.get("OLLAMA_HOST")
+                or "http://localhost:11434"
+            ).strip().rstrip("/"),
             ollama_num_ctx=int(os.environ.get("OLLAMA_NUM_CTX", "4096")),
             llm_temperature=float(os.environ.get("LLM_TEMPERATURE", "0.2")),
-            gemini_api_key=(
-                os.environ.get("GEMINI_API_KEY")
-                or os.environ.get("GOOGLE_API_KEY")
-                or ""
-            ).strip(),
-            gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip(),
-            github_pat=os.environ.get("GITHUB_PAT", "").strip(),
+            github_pat=github_pat,
             portfolio_repo_url=os.environ.get("PORTFOLIO_REPO_URL", "").strip(),
             portfolio_projects_path=os.environ.get(
                 "PORTFOLIO_PROJECTS_PATH", "src/data/projects.js"
@@ -148,13 +110,12 @@ class Settings:
             linkedin_access_token=os.environ.get("LINKEDIN_ACCESS_TOKEN", "").strip(),
             linkedin_person_urn=os.environ.get("LINKEDIN_PERSON_URN", "").strip(),
             linkedin_visibility=visibility,
-            webhook_secret=webhook_secret,
             hub_server_url=os.environ.get(
                 "HUB_SERVER_URL", "http://localhost:8000"
             ).strip().rstrip("/"),
-            data_dir=data_dir,
-            temp_root_dir=temp_root,
+            data_dir=Path(os.environ.get("DATA_DIR", str(BASE_DIR / "data"))).resolve(),
+            temp_root_dir=Path(
+                os.environ.get("TEMP_ROOT_DIR", str(BASE_DIR / "temp_workspace"))
+            ).resolve(),
             max_readme_chars=int(os.environ.get("MAX_README_CHARS", "14000")),
-            max_history_items=int(os.environ.get("MAX_HISTORY_ITEMS", "30")),
-            allowed_git_hosts=allowed_hosts,
         )

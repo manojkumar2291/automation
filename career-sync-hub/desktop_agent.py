@@ -1,9 +1,9 @@
-"""Step 2: Safe Local Desktop Macro CLI Tool (`desktop_agent.py`).
+"""Desktop Macro CLI Tool (`desktop_agent.py`) for FlowCV & LinkedIn Profile Projects.
 
 Launches FlowCV or LinkedIn in your real native desktop browser (zero WebDriver/bot
-fingerprints), copies structured text via `pyperclip`, runs a visible 5-second
-countdown timer so you can click the target input field, and triggers native OS paste
-(`ctrl+v` on Windows/Linux, `cmd+v` on macOS) via `pyautogui`.
+fingerprints), copies structured text via `pyperclip`, runs a visible countdown timer
+so you can click the target input field, and triggers native OS paste (`Ctrl+V` / `Cmd+V`)
+via `pyautogui`.
 """
 
 from __future__ import annotations
@@ -28,27 +28,17 @@ LINKEDIN_PROJECTS_URL = "https://www.linkedin.com/in/me/"
 LINKEDIN_FEED_URL = "https://www.linkedin.com/feed/"
 
 
-def get_paste_hotkey() -> tuple[str, str]:
-    """Return the native OS paste key chord (`command+v` on macOS, `ctrl+v` elsewhere)."""
-    if platform.system() == "Darwin":
-        return ("command", "v")
-    return ("ctrl", "v")
+# ============================================================================
+# Section 1: Data Loading (`latest_generation.json` & `history.json`)
+# ============================================================================
 
 
-def format_hotkey_label() -> str:
-    mod, key = get_paste_hotkey()
-    return "Cmd+V" if mod == "command" else f"{mod.capitalize()}+{key.upper()}"
-
-
-def fetch_remote_json(url: str, secret: str = "") -> Any:
-    """Fetch JSON from a remote `career-sync-hub` server (`/latest` or `/history`)."""
+def fetch_remote_json(url: str) -> Any:
+    """Fetch JSON from a running `career-sync-hub` server (`/latest` or `/history`)."""
     headers = {
         "Accept": "application/json",
         "User-Agent": "career-sync-hub-desktop/1.0",
     }
-    if secret:
-        headers["Authorization"] = f"Bearer {secret}"
-
     req = Request(url, headers=headers, method="GET")
     with urlopen(req, timeout=12) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -58,13 +48,11 @@ def load_history_records(
     settings: Settings,
     force_remote: bool = False,
 ) -> list[dict[str, Any]]:
-    """Load evaluated project history from remote hub or local `data/history.json`."""
+    """Load evaluated project history from local `data/history.json` or remote hub."""
     local_history = settings.data_dir / "history.json"
     if (force_remote or not local_history.is_file()) and settings.hub_server_url:
         try:
-            data = fetch_remote_json(
-                f"{settings.hub_server_url}/history", settings.webhook_secret
-            )
+            data = fetch_remote_json(f"{settings.hub_server_url}/history")
             if isinstance(data, list):
                 return data
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
@@ -86,22 +74,22 @@ def load_generation_payload(
     force_remote: bool = False,
     select_query: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Resolve target generation payload from `--file`, `--select`, remote API, or local disk."""
+    """Resolve target project evaluation from `--file`, `--select`, local disk, or `/latest`."""
     if file_override:
         fpath = Path(file_override).expanduser().resolve()
         if not fpath.is_file():
             raise FileNotFoundError(f"Specified JSON file does not exist: {fpath}")
-        return json.loads(fpath.read_text(encoding="utf-8"))
+        raw = json.loads(fpath.read_text(encoding="utf-8"))
+        return EvaluationResult.model_validate(raw).model_dump()
 
     if select_query:
         records = load_history_records(settings, force_remote=force_remote)
         if not records:
             raise FileNotFoundError("No generation history records found to select from.")
-        # Match by 1-based numeric index, slug `id`, or substring of `project_name`
         if select_query.isdigit():
             idx = int(select_query) - 1
             if 0 <= idx < len(records):
-                return records[idx]
+                return EvaluationResult.model_validate(records[idx]).model_dump()
             raise ValueError(
                 f"History index {select_query} out of range (1..{len(records)})."
             )
@@ -111,7 +99,7 @@ def load_generation_payload(
                 str(rec.get("id", "")).lower() == q
                 or q in str(rec.get("project_name", "")).lower()
             ):
-                return rec
+                return EvaluationResult.model_validate(rec).model_dump()
         raise ValueError(f"No project in history matched {select_query!r}.")
 
     local_latest = settings.data_dir / "latest_generation.json"
@@ -120,30 +108,27 @@ def load_generation_payload(
             raise RuntimeError(
                 "`--remote` was requested, but HUB_SERVER_URL is not configured in .env."
             )
-        data = fetch_remote_json(
-            f"{settings.hub_server_url}/latest", settings.webhook_secret
-        )
-        # Cache locally for offline reuse
+        raw = fetch_remote_json(f"{settings.hub_server_url}/latest")
+        validated = EvaluationResult.model_validate(raw).model_dump()
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         local_latest.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            json.dumps(validated, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
-        return data
+        return validated
 
     if local_latest.is_file():
-        return json.loads(local_latest.read_text(encoding="utf-8"))
+        raw = json.loads(local_latest.read_text(encoding="utf-8"))
+        return EvaluationResult.model_validate(raw).model_dump()
 
-    # Hybrid auto-fallback: if no local file exists yet, pull from HUB_SERVER_URL if configured
     if settings.hub_server_url:
         try:
-            data = fetch_remote_json(
-                f"{settings.hub_server_url}/latest", settings.webhook_secret
-            )
+            raw = fetch_remote_json(f"{settings.hub_server_url}/latest")
+            validated = EvaluationResult.model_validate(raw).model_dump()
             settings.data_dir.mkdir(parents=True, exist_ok=True)
             local_latest.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+                json.dumps(validated, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
-            return data
+            return validated
         except (HTTPError, URLError, TimeoutError) as exc:
             raise FileNotFoundError(
                 f"No local `{local_latest}` found and remote fetch from "
@@ -151,9 +136,13 @@ def load_generation_payload(
             ) from exc
 
     raise FileNotFoundError(
-        f"No evaluation data found at `{local_latest}`. Trigger a push webhook first "
-        "or configure `HUB_SERVER_URL` in `.env`."
+        f"No evaluation data found at `{local_latest}`. Run `/analyze` or `publish.py` first."
     )
+
+
+# ============================================================================
+# Section 2: FlowCV & LinkedIn Field Formatters
+# ============================================================================
 
 
 def build_flowcv_text(data: dict[str, Any], bullet_prefix: str = "") -> str:
@@ -226,6 +215,23 @@ def build_linkedin_steps(data: dict[str, Any]) -> list[tuple[str, str]]:
     return steps
 
 
+# ============================================================================
+# Section 3: Native Clipboard & OS Paste Engine (`pyperclip` + `pyautogui`)
+# ============================================================================
+
+
+def get_paste_hotkey() -> tuple[str, str]:
+    """Return the native OS paste key chord (`command+v` on macOS, `ctrl+v` elsewhere)."""
+    if platform.system() == "Darwin":
+        return ("command", "v")
+    return ("ctrl", "v")
+
+
+def format_hotkey_label() -> str:
+    mod, key = get_paste_hotkey()
+    return "Cmd+V" if mod == "command" else f"{mod.capitalize()}+{key.upper()}"
+
+
 def countdown_and_paste(
     text: str,
     label: str,
@@ -245,8 +251,8 @@ def countdown_and_paste(
         return
 
     try:
-        import pyperclip
         import pyautogui
+        import pyperclip
     except Exception as import_err:
         raise RuntimeError(
             "PyAutoGUI / Pyperclip could not initialize the GUI display or clipboard. "
@@ -258,10 +264,6 @@ def countdown_and_paste(
 
     pyperclip.copy(text)
     if pyperclip.paste() != text:
-        print(
-            "Warning: Clipboard verification mismatch; retrying clipboard write...",
-            file=sys.stderr,
-        )
         time.sleep(0.15)
         pyperclip.copy(text)
 
@@ -275,7 +277,6 @@ def countdown_and_paste(
     sys.stdout.flush()
 
     modifier, key = get_paste_hotkey()
-    # Small settle delay before key chord improves reliability on macOS & Wayland/X11
     time.sleep(0.1)
     pyautogui.hotkey(modifier, key)
     print(f"Done pasting [{label}].")
@@ -312,19 +313,23 @@ def run_step_workflow(
         countdown_and_paste(content, label=label, delay_seconds=delay_seconds, dry_run=False)
 
 
+# ============================================================================
+# Section 4: CLI Entrypoint
+# ============================================================================
+
+
 def print_history_table(records: list[dict[str, Any]]) -> None:
     if not records:
         print("No evaluated projects found in history.")
         return
 
-    print(f"\nRecent High-Impact Evaluations ({len(records)}):")
+    print(f"\nRecent Evaluated Projects ({len(records)}):")
     print(f"{'-' * 76}")
     for idx, rec in enumerate(records, start=1):
         pid = rec.get("id", "unknown")
         name = rec.get("project_name", "Untitled")
-        score = rec.get("impact_score", "?")
         ts = str(rec.get("evaluated_at") or "")[:19].replace("T", " ")
-        print(f"  [{idx}] {name} (id: {pid}) | score: {score}/10 | {ts}")
+        print(f"  [{idx}] {name} (id: {pid}) | {ts}")
     print(f"{'-' * 76}")
     print("Tip: Pass `--select <number_or_id>` with `--flowcv` or `--linkedin`.")
 
@@ -350,7 +355,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--linkedin-post",
         action="store_true",
-        help="Fallback manual paste for LinkedIn Feed launch post (if not using LINKEDIN_ACCESS_TOKEN).",
+        help="Fallback manual paste for LinkedIn Feed launch post.",
     )
     parser.add_argument(
         "--step",
@@ -365,7 +370,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bullet-prefix",
         default="",
-        help="Optional prefix for each FlowCV line (e.g. '• '). Default is clean newline-separated lines.",
+        help="Optional prefix for each FlowCV line (e.g. '• ').",
     )
     parser.add_argument(
         "--delay",
@@ -508,4 +513,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

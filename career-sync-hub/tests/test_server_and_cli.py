@@ -1,10 +1,7 @@
-"""Unit tests for README-driven release pipeline, LinkedIn API publisher, Brief, and CLI."""
+"""Unit tests for direct README.md content pipeline, LinkedIn API publisher, Brief, and CLI."""
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import io
 import json
 from pathlib import Path
 import sys
@@ -32,6 +29,7 @@ SAMPLE_PROJECT_README = """# Multi-Agent RAG Document Assistant
 A production-ready FastAPI document question-answering backend combining semantic Chroma retrieval
 with LangChain query planning, grounded answer drafting, and automated review.
 
+Repository: https://github.com/manojkumar2291/multi-agent-rag
 Live Demo: https://rag-assistant-demo.vercel.app
 
 ## Tech Stack
@@ -58,22 +56,28 @@ def test_strip_ats_and_linkedin_markdown_sanitizers() -> None:
     assert "• Built with FastAPI" in cleaned_post
 
 
-def test_resolve_readme_input_from_local_file_and_extract_demo_link(
-    tmp_path: Path,
-) -> None:
-    proj_dir = tmp_path / "multi-agent-rag"
-    proj_dir.mkdir()
-    readme_file = proj_dir / "README.md"
-    readme_file.write_text(SAMPLE_PROJECT_README, encoding="utf-8")
-
+def test_parse_readme_content_extracts_slug_demo_and_respects_privacy() -> None:
     cfg = server.Settings.from_env()
-    resolved = server.resolve_readme_input(
-        AnalyzeRequest(readme_path=str(readme_file)),
+
+    # Public project: extracts both demo link and GitHub source_code_link from README content
+    parsed_public = server.parse_readme_content(
+        AnalyzeRequest(readme_content=SAMPLE_PROJECT_README, is_private=False),
         cfg,
     )
-    assert "Multi-Agent RAG Document Assistant" in resolved["readme_text"]
-    assert resolved["default_slug"] == "multi-agent-rag"
-    assert resolved["live_demo_link"] == "https://rag-assistant-demo.vercel.app"
+    assert parsed_public["default_slug"] == "multi-agent-rag-document-assistant"
+    assert parsed_public["live_demo_link"] == "https://rag-assistant-demo.vercel.app"
+    assert (
+        parsed_public["source_code_link"]
+        == "https://github.com/manojkumar2291/multi-agent-rag"
+    )
+
+    # Private project: omits source_code_link even if a GitHub URL is mentioned in README
+    parsed_private = server.parse_readme_content(
+        AnalyzeRequest(readme_content=SAMPLE_PROJECT_README, is_private=True),
+        cfg,
+    )
+    assert parsed_private["source_code_link"] is None
+    assert parsed_private["live_demo_link"] == "https://rag-assistant-demo.vercel.app"
 
 
 def test_linkedin_api_publisher_resolves_oidc_urn_and_posts_ugc_article(
@@ -131,7 +135,6 @@ def test_linkedin_api_publisher_resolves_oidc_urn_and_posts_ugc_article(
     assert action["author_urn"] == "urn:li:person:member987"
     assert action["post_url"] == "https://www.linkedin.com/feed/update/urn:li:share:777888999/"
 
-    # Verify ugcPosts payload attached ARTICLE media preview card
     post_method, post_url, post_body = captured_requests[1]
     assert post_method == "POST"
     assert post_url.endswith("/v2/ugcPosts")
@@ -140,7 +143,7 @@ def test_linkedin_api_publisher_resolves_oidc_urn_and_posts_ugc_article(
     assert share_content["media"][0]["originalUrl"] == "https://rag-assistant-demo.vercel.app"
 
 
-def test_end_to_end_readme_release_pipeline_and_publish_cli(
+def test_end_to_end_readme_content_pipeline_and_publish_cli(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -149,7 +152,6 @@ def test_end_to_end_readme_release_pipeline_and_publish_cli(
     monkeypatch.setenv("DATA_DIR", str(data_dir))
     monkeypatch.setenv("PORTFOLIO_REPO_URL", "")
     monkeypatch.setenv("LINKEDIN_ACCESS_TOKEN", "")
-    monkeypatch.setenv("WEBHOOK_SECRET", "")
 
     readme_file = tmp_path / "README.md"
     readme_file.write_text(SAMPLE_PROJECT_README, encoding="utf-8")
@@ -182,7 +184,6 @@ def test_end_to_end_readme_release_pipeline_and_publish_cli(
 
     monkeypatch.setattr(server, "build_chat_model", lambda _cfg: FakeChatOllama())
 
-    # Run via publish.py CLI (--direct --dry-run)
     rc = publish.main(["--readme", str(readme_file), "--direct", "--dry-run"])
     assert rc == 0
     cli_out = capsys.readouterr().out
@@ -191,7 +192,6 @@ def test_end_to_end_readme_release_pipeline_and_publish_cli(
     assert (data_dir / "latest_brief.md").is_file()
     assert (data_dir / "latest_generation.json").is_file()
 
-    # Verify desktop_agent.py previews all 3 channels (--flowcv, --linkedin, --linkedin-post)
     rc_agent = desktop_agent.main(
         ["--flowcv", "--linkedin", "--linkedin-post", "--preview"]
     )
@@ -200,13 +200,3 @@ def test_end_to_end_readme_release_pipeline_and_publish_cli(
     assert "Architected a multi-agent RAG API in FastAPI and LangChain." in agent_out
     assert "LinkedIn Feed Launch Post — Multi-Agent RAG Document Assistant" in agent_out
     assert "**Multi-Agent RAG**" not in agent_out
-
-
-def test_webhook_auth_validation() -> None:
-    secret = "my-secret"
-    body = b'{"readme_content": "# Hello"}'
-    sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-
-    assert not server.validate_webhook_credentials(secret, body)
-    assert server.validate_webhook_credentials(secret, body, authorization="Bearer my-secret")
-    assert server.validate_webhook_credentials(secret, body, x_hub_signature_256=sig)

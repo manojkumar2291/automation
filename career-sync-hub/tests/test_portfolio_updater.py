@@ -135,7 +135,6 @@ def _sample_result(**overrides) -> EvaluationResult:
             "- Implemented lossless JavaScript ES-module surgical AST span replacement.",
         ],
         linkedin_profile="I built Career Sync Hub to turn meaningful git pushes into live portfolio and CV updates.",
-        repo_url="https://github.com/manojkumar2291/career-sync-hub",
         source_code_link="https://github.com/manojkumar2291/career-sync-hub",
     )
     base.update(overrides)
@@ -169,7 +168,6 @@ def test_update_existing_project_by_source_link_preserves_id_image_and_demo() ->
     res = _sample_result(
         id="vibe-ecommerce",
         project_name="Vibe E-Commerce Platform",
-        repo_url="https://github.com/manojkumar2291/vibe.git",
         source_code_link="https://github.com/manojkumar2291/vibe",
         live_demo_link=None,
     )

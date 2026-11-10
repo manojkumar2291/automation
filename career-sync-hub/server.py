@@ -1,19 +1,15 @@
-"""Step 1: README-Driven Career Sync Hub (`server.py`).
+"""Central FastAPI Server & Release Pipeline (`server.py`).
 
-Workflow:
-1. Receive a completed project's `README.md` (via local path, raw markdown, or GitHub URL).
-2. Extract structured portfolio, ATS resume, LinkedIn profile, and LinkedIn post copy via LangChain `ChatOllama`.
-3. Surgically upsert your React portfolio's `projects.js` and push to GitHub.
-4. Automatically publish a launch post to LinkedIn via `LINKEDIN_ACCESS_TOKEN`.
-5. Save `data/latest_generation.json` + `data/latest_brief.md` and return a complete Executive Brief.
+Structured into 4 clear sections:
+  1. README.md Content Parser (Extracts Title, Slug, Demo Link, and GitHub Link from Markdown)
+  2. Ollama LLM Evaluator (`ChatOllama` structured output)
+  3. Portfolio Git Updater & Executive Brief Builder
+  4. FastAPI HTTP Endpoints (`/analyze`, `/analyze/raw`, `/brief`, `/latest`, `/history`, `/health`)
 """
 
 from __future__ import annotations
 
-import base64
 from datetime import datetime, timezone
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -25,15 +21,12 @@ import sys
 import threading
 import time
 from typing import Any, Optional
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 import uuid
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request as FastAPIRequest
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 import git
-from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
@@ -56,479 +49,224 @@ logger = logging.getLogger("career-sync-hub.server")
 
 app = FastAPI(
     title="career-sync-hub",
-    description="README-driven career automation hub for Portfolio, FlowCV Resume, and LinkedIn.",
-    version="2.0.0",
+    description="Direct README.md content analyzer for React Portfolio, FlowCV Resume, and LinkedIn.",
+    version="2.1.0",
 )
 
 _PORTFOLIO_LOCK = threading.Lock()
 _DATA_LOCK = threading.Lock()
 
-EMBEDDING_MODEL_KEYWORDS = ("embed", "minilm", "bge-", "e5-")
-
-DEMO_HOST_PATTERNS = re.compile(
-    r"https?://[^\s)>\]]*(?:vercel\.app|netlify\.app|onrender\.com|railway\.app|fly\.dev|pages\.dev|github\.io)[^\s)>\]]*",
+DEMO_URL_PATTERN = re.compile(
+    r"https?://[^\s)>\]]*(?:vercel\.app|netlify\.app|onrender\.com|railway\.app|fly\.dev|pages\.dev|github\.io|streamlit\.app)[^\s)>\]]*",
     re.IGNORECASE,
 )
+GITHUB_REPO_URL_PATTERN = re.compile(
+    r"https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
+    re.IGNORECASE,
+)
+HEADING_PATTERN = re.compile(r"(?m)^#\s+(.+)$")
 
 SYSTEM_PROMPT = """You are an elite Principal Staff Engineer, Technical CV Writer, and Developer Advocate.
-Analyze the provided `README.md` of a newly completed software engineering project and generate tailored career content across 4 channels:
+Analyze the provided `README.md` content of a completed software project and generate structured content for 4 channels:
 
-1. React Portfolio Catalog (`id`, `project_name`, `subtitle`, `category`, `categories`, `status`, `icon`, `artCaption`, `architecture_summary`, `tech_stack`, `highlights`, `workflow`, `details`):
-   - `id`: Clean kebab-case slug identifier for the portfolio route.
-   - `subtitle`: Crisp 3-6 word tagline (e.g. 'Plan. Retrieve. Answer. Review.').
-   - `artCaption`: Short uppercase visual pipeline banner with '→' (e.g. 'README → PORTFOLIO & LINKEDIN').
-   - `workflow`: 3-4 ordered architectural steps (`title`, `description`) explaining end-to-end execution.
+1. React Portfolio (`id`, `project_name`, `subtitle`, `category`, `categories`, `status`, `icon`, `artCaption`, `architecture_summary`, `tech_stack`, `highlights`, `workflow`, `details`):
+   - `id`: Clean kebab-case slug identifier (e.g. 'multi-agent-rag').
+   - `subtitle`: Short 3-6 word tagline.
+   - `artCaption`: Uppercase pipeline banner with '→' (e.g. 'DOCUMENTS → GROUNDED ANSWERS').
+   - `workflow`: 3-4 ordered architectural steps (`title`, `description`).
    - `details`: 2-3 deep-dive sections (`Engineering decisions`, `Testing approach`, `Current scope`).
 
 2. FlowCV ATS Resume (`flowcv_format`):
-   - 3 to 5 high-impact ATS resume bullets starting with strong past-tense action verbs (Architected, Engineered, Built, Automated, Implemented).
-   - Plain text ONLY: NEVER use **bold** markdown or leading bullet symbols.
+   - 3 to 5 plain-text ATS resume bullets starting with past-tense action verbs (Architected, Engineered, Built, Automated, Implemented).
+   - Plain text ONLY (never use **bold** markdown or leading bullets).
 
 3. LinkedIn Profile Project (`linkedin_profile`):
-   - A 1st-person systems engineering paragraph (4-6 sentences) written for LinkedIn's Profile -> Projects section.
+   - A 1st-person engineering narrative paragraph (4-6 sentences) for LinkedIn's Profile -> Projects section.
 
-4. LinkedIn Public Launch Post (`linkedin_post`):
-   - An authentic, engaging 1st-person LinkedIn feed post (120-200 words) announcing the completed project:
-     • Punchy 1-2 line opening hook on what you built and the real problem it solves
-     • 3-4 concise engineering highlights prefixed with '• '
-     • Brief tech stack mention + 3-5 relevant hashtags at the end
-   - Plain Unicode text ONLY (do NOT use **asterisks** for bolding).
+4. LinkedIn Feed Launch Post (`linkedin_post`):
+   - An engaging 1st-person LinkedIn post (120-200 words) with an opening hook, 3-4 '• ' bullet highlights, tech stack, and 3-5 hashtags. Plain text ONLY (no **asterisks**).
 
 5. Executive Brief (`executive_brief`):
-   - A crisp 2-3 sentence summary of the project's core engineering value and positioning.
+   - A concise 2-3 sentence summary of the project and how it was positioned.
 
-Ground every single technology, feature, and claim strictly in the provided `README.md`. Never fabricate metrics."""
+Ground every claim strictly in the provided `README.md` content."""
+
+
+# ============================================================================
+# Section 1: README.md Content Parser & Workspace Helpers
+# ============================================================================
 
 
 def safe_rmtree(path: Path | str) -> None:
-    """Safely remove temporary git workspaces across Windows, macOS, and Linux."""
+    """Remove a temporary directory tree safely on Windows, macOS, and Linux."""
     target = Path(path)
     if not target.exists():
         return
 
-    def _handle_readonly_exc(func: Any, failed_path: str, _exc: BaseException) -> None:
+    def _clear_readonly(func: Any, failed_path: str, _exc: Any) -> None:
         try:
             os.chmod(failed_path, stat.S_IWRITE | stat.S_IREAD)
             func(failed_path)
-        except OSError as cleanup_err:
-            logger.warning("Could not remove %s: %s", failed_path, cleanup_err)
-
-    def _handle_readonly_err(func: Any, failed_path: str, exc_info: Any) -> None:
-        _handle_readonly_exc(func, failed_path, exc_info[1])
+        except OSError:
+            pass
 
     if sys.version_info >= (3, 12):
-        shutil.rmtree(target, onexc=_handle_readonly_exc)
+        shutil.rmtree(target, onexc=_clear_readonly)
     else:
-        shutil.rmtree(target, onerror=_handle_readonly_err)
+        shutil.rmtree(target, onerror=lambda f, p, e: _clear_readonly(f, p, e[1]))
 
 
-def sanitize_secret(text: str, secret: str) -> str:
-    if not secret:
-        return text
-    return text.replace(secret, "***")
-
-
-def validate_and_clean_repo_url(raw_url: str, allowed_hosts: tuple[str, ...]) -> str:
-    """Normalize git SSH or HTTPS URLs into clean `https://host/owner/repo`."""
+def clean_github_https_url(raw_url: str) -> str:
+    """Normalize a Git SSH or HTTPS URL into `https://github.com/owner/repo`."""
     cleaned = raw_url.strip()
-    # Convert git@github.com:owner/repo.git -> https://github.com/owner/repo
     ssh_match = re.match(r"^git@([^:]+):(.+)$", cleaned)
     if ssh_match:
         cleaned = f"https://{ssh_match.group(1)}/{ssh_match.group(2)}"
 
     parsed = urlparse(cleaned)
-    if parsed.scheme != "https":
-        raise ValueError(f"Only https:// repository URLs are permitted (got {parsed.scheme!r}).")
-
-    hostname = (parsed.hostname or "").lower()
-    if not hostname or (allowed_hosts and hostname not in allowed_hosts):
-        raise ValueError(
-            f"Repository host {hostname!r} is not in ALLOWED_GIT_HOSTS {allowed_hosts}."
-        )
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError(f"Expected an https:// repository URL (got {raw_url!r}).")
 
     clean_path = re.sub(r"\.git$", "", parsed.path.rstrip("/"))
-    if not clean_path or clean_path == "/":
-        raise ValueError("Repository URL must include an owner/repo path.")
-    return f"https://{hostname}{clean_path}"
+    return f"https://{parsed.hostname.lower()}{clean_path}"
 
 
-def build_authenticated_git_url(clean_https_url: str, gh_token: str) -> str:
-    if not gh_token:
-        return clean_https_url
-    return clean_https_url.replace("https://", f"https://x-access-token:{gh_token}@", 1)
-
-
-def detect_git_remote_from_local_path(readme_file: Path, allowed_hosts: tuple[str, ...]) -> Optional[str]:
-    """If `readme_file` lives inside a local git repo, infer its `origin` HTTPS URL."""
-    try:
-        repo = git.Repo(str(readme_file.parent), search_parent_directories=True)
-        try:
-            if "origin" in [r.name for r in repo.remotes]:
-                raw_url = repo.remotes.origin.url
-                return validate_and_clean_repo_url(raw_url, allowed_hosts)
-        finally:
-            repo.close()
-    except Exception:
-        return None
-    return None
-
-
-def fetch_github_repo_metadata(clean_repo_url: str, gh_token: str) -> dict[str, Any]:
-    """Fetch repository visibility (`private`), `homepage`, and `description` from GitHub API."""
-    parsed = urlparse(clean_repo_url)
-    if (parsed.hostname or "").lower() != "github.com":
-        return {}
-
-    parts = [p for p in parsed.path.strip("/").split("/") if p]
-    if len(parts) < 2:
-        return {}
-
-    api_url = f"https://api.github.com/repos/{parts[0]}/{parts[1]}"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "career-sync-hub/2.0",
-    }
-    if gh_token:
-        headers["Authorization"] = f"Bearer {gh_token}"
-
-    req = Request(api_url, headers=headers, method="GET")
-    try:
-        with urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-        logger.debug("GitHub metadata lookup skipped for %s: %s", clean_repo_url, exc)
-        return {}
-
-
-def fetch_github_readme(clean_repo_url: str, gh_token: str) -> str:
-    """Fetch `README.md` directly via GitHub REST API in ~0.2s (zero git clone needed!)."""
-    parsed = urlparse(clean_repo_url)
-    parts = [p for p in parsed.path.strip("/").split("/") if p]
-    if (parsed.hostname or "").lower() != "github.com" or len(parts) < 2:
-        raise ValueError(
-            "Automatic remote README fetch requires a github.com URL, or pass `readme_path` / `readme_content`."
-        )
-
-    api_url = f"https://api.github.com/repos/{parts[0]}/{parts[1]}/readme"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "career-sync-hub/2.0",
-    }
-    if gh_token:
-        headers["Authorization"] = f"Bearer {gh_token}"
-
-    req = Request(api_url, headers=headers, method="GET")
-    try:
-        with urlopen(req, timeout=12) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            encoded = str(data.get("content") or "")
-            if encoded:
-                return base64.b64decode(encoded).decode("utf-8", errors="replace")
-    except HTTPError as err:
-        raise FileNotFoundError(
-            f"Could not fetch README.md from {clean_repo_url} (HTTP {err.code}). "
-            "Ensure README.md exists on the default branch or pass `--readme` locally."
-        ) from err
-
-    raise FileNotFoundError(f"Empty README response from {clean_repo_url}.")
-
-
-def extract_demo_link_from_readme(readme_text: str) -> Optional[str]:
-    """Auto-detect a live deployment link (Vercel, Netlify, Render, Railway, etc.) in README."""
-    match = DEMO_HOST_PATTERNS.search(readme_text)
-    if match:
-        return match.group(0).rstrip(".,;)")
-    return None
-
-
-def _looks_like_local_path(value: str) -> bool:
-    """Return True if `value` is a Windows/POSIX local file path rather than a URL."""
-    cleaned = value.strip().strip('"').strip("'")
-    if not cleaned:
-        return False
-    if cleaned.lower().startswith(("http://", "https://", "git@")):
-        return False
-    if re.match(r"^[a-zA-Z]:[\\/]", cleaned) or cleaned.startswith((".", "/", "\\")):
-        return True
-    if cleaned.lower().endswith(".md") or Path(cleaned).expanduser().exists():
-        return True
-    return False
-
-
-def resolve_readme_input(
-    req: AnalyzeRequest,
-    settings: Settings,
-) -> dict[str, Any]:
-    """Resolve README text, repository URL, privacy flag, and live demo link from any input mode."""
-    raw_repo_url = (req.repo_url or "").strip().strip('"').strip("'")
-    raw_readme_path = (req.readme_path or "").strip().strip('"').strip("'")
-
-    # Smart UX auto-fix: if the user pasted a local `C:\...\README.md` path into `repo_url`
-    # (e.g. inside Swagger UI), treat it as `readme_path` automatically!
-    if raw_repo_url and not raw_readme_path and _looks_like_local_path(raw_repo_url):
-        raw_readme_path = raw_repo_url
-        raw_repo_url = ""
-
-    clean_repo_url: Optional[str] = None
-    if raw_repo_url:
-        clean_repo_url = validate_and_clean_repo_url(
-            raw_repo_url, settings.allowed_git_hosts
-        )
-
-    readme_text = ""
-    source_label = ""
-
-    if req.readme_content and req.readme_content.strip():
-        readme_text = req.readme_content.strip()
-        source_label = "inline README markdown"
-    elif raw_readme_path:
-        local_file = Path(raw_readme_path).expanduser().resolve()
-        if local_file.is_dir():
-            # Allow passing project folder path directly—auto-locate README.md inside it!
-            for candidate in ("README.md", "readme.md", "Readme.md"):
-                if (local_file / candidate).is_file():
-                    local_file = local_file / candidate
-                    break
-        if not local_file.is_file():
-            raise FileNotFoundError(f"Local README file not found: {local_file}")
-        readme_text = local_file.read_text(encoding="utf-8", errors="replace").strip()
-        source_label = str(local_file)
-        if not clean_repo_url:
-            clean_repo_url = detect_git_remote_from_local_path(
-                local_file, settings.allowed_git_hosts
-            )
-    elif clean_repo_url:
-        readme_text = fetch_github_readme(clean_repo_url, settings.github_pat).strip()
-        source_label = f"{clean_repo_url}/README.md"
-    else:
-        raise ValueError(
-            "Provide at least one of `readme_content`, `readme_path`, or `repo_url`."
-        )
-
+def parse_readme_content(req: AnalyzeRequest, settings: Settings) -> dict[str, Any]:
+    """Extract clean Markdown text, project slug, demo URL, and GitHub link from `readme_content`."""
+    readme_text = (req.readme_content or "").strip()
     if not readme_text:
-        raise ValueError(f"The resolved README ({source_label}) is empty.")
+        raise ValueError("`readme_content` cannot be empty.")
 
     if len(readme_text) > settings.max_readme_chars:
-        readme_text = (
-            readme_text[: settings.max_readme_chars]
-            + f"\n\n... [README truncated at {settings.max_readme_chars} chars] ..."
-        )
+        readme_text = readme_text[: settings.max_readme_chars]
 
-    gh_meta = (
-        fetch_github_repo_metadata(clean_repo_url, settings.github_pat)
-        if clean_repo_url
-        else {}
-    )
-    is_private = (
-        req.is_private
-        if req.is_private is not None
-        else bool(gh_meta.get("private", False))
-    )
+    # 1. Extract default project slug from the first `# Heading` in the README
+    heading_match = HEADING_PATTERN.search(readme_text)
+    heading_title = heading_match.group(1).strip() if heading_match else ""
+    default_slug = slugify_id(heading_title) if heading_title else "project"
 
-    live_demo = (
-        req.live_demo_link
-        or str(gh_meta.get("homepage") or "").strip()
-        or extract_demo_link_from_readme(readme_text)
-        or None
-    )
+    # 2. Extract Live Demo URL if present inside the README content
+    demo_match = DEMO_URL_PATTERN.search(readme_text)
+    live_demo_link = demo_match.group(0).rstrip(".,;)") if demo_match else None
 
+    # 3. Extract GitHub source_code_link from README content (unless `is_private=True`)
     source_code_link: Optional[str] = None
-    if clean_repo_url and not is_private:
-        if "private" in gh_meta or req.is_private is False or not settings.github_pat:
-            source_code_link = clean_repo_url
-
-    default_slug = "project"
-    if req.project_name_hint:
-        default_slug = slugify_id(req.project_name_hint)
-    elif clean_repo_url:
-        default_slug = slugify_id(urlparse(clean_repo_url).path.rstrip("/").split("/")[-1])
-    elif raw_readme_path:
-        p = Path(raw_readme_path).expanduser().resolve()
-        folder = p.name if p.is_dir() else p.parent.name
-        default_slug = slugify_id(folder)
+    if not req.is_private:
+        gh_match = GITHUB_REPO_URL_PATTERN.search(readme_text)
+        if gh_match:
+            candidate = clean_github_https_url(gh_match.group(0).rstrip(".,;)"))
+            if not settings.portfolio_repo_url or normalize_repo_url(
+                candidate
+            ) != normalize_repo_url(settings.portfolio_repo_url):
+                source_code_link = candidate
 
     return {
         "readme_text": readme_text,
-        "source_label": source_label,
-        "repo_url": clean_repo_url,
-        "source_code_link": source_code_link,
-        "live_demo_link": live_demo,
         "default_slug": default_slug,
-        "project_name_hint": req.project_name_hint,
+        "live_demo_link": live_demo_link,
+        "source_code_link": source_code_link,
     }
 
 
-def list_installed_ollama_chat_models(ollama_base_url: str) -> Optional[list[str]]:
-    tags_url = f"{ollama_base_url.rstrip('/')}/api/tags"
-    req = Request(tags_url, headers={"Accept": "application/json"}, method="GET")
-    try:
-        with urlopen(req, timeout=4) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
-        return None
-
-    raw_models = payload.get("models")
-    if not isinstance(raw_models, list):
-        return []
-
-    chat_models: list[str] = []
-    for item in raw_models:
-        name = str(item.get("name") or item.get("model") or "").strip()
-        if name and not any(kw in name.lower() for kw in EMBEDDING_MODEL_KEYWORDS):
-            chat_models.append(name)
-    return chat_models
+# ============================================================================
+# Section 2: Ollama LLM Evaluator (`ChatOllama`)
+# ============================================================================
 
 
-def resolve_ollama_model_name(configured_model: str, installed: Optional[list[str]]) -> str:
-    if installed is None:
-        return configured_model
-
-    if not installed:
-        raise RuntimeError(
-            f"No local chat models are pulled in Ollama yet (requested {configured_model!r}). "
-            f"Run `ollama pull {configured_model}` in PowerShell."
-        )
-
-    for candidate in installed:
-        if candidate == configured_model or candidate == f"{configured_model}:latest":
-            return candidate
-        if ":" not in configured_model and candidate.split(":", 1)[0] == configured_model:
-            return candidate
-
-    fallback = installed[0]
-    logger.warning(
-        "Configured OLLAMA_MODEL %r not found locally; auto-using installed model %r.",
-        configured_model,
-        fallback,
-    )
-    return fallback
-
-
-def build_chat_model(settings: Settings) -> BaseChatModel:
-    if settings.llm_provider in {"gemini", "google", "google_genai"}:
-        if not settings.gemini_api_key:
-            raise RuntimeError(
-                "LLM_PROVIDER=gemini requires GEMINI_API_KEY in .env."
-            )
-        from langchain_google_genai import ChatGoogleGenerativeAI
-
-        return ChatGoogleGenerativeAI(
-            model=settings.gemini_model,
-            google_api_key=settings.gemini_api_key,
-            temperature=settings.llm_temperature,
-        )
-
-    installed = list_installed_ollama_chat_models(settings.ollama_base_url)
-    resolved_model = resolve_ollama_model_name(settings.ollama_model, installed)
+def build_chat_model(settings: Settings) -> ChatOllama:
+    """Create the local LangChain `ChatOllama` model configured in `.env`."""
     return ChatOllama(
-        model=resolved_model,
+        model=settings.ollama_model,
         base_url=settings.ollama_base_url,
         num_ctx=settings.ollama_num_ctx,
+        num_predict=2048,
         temperature=settings.llm_temperature,
     )
 
 
 def evaluate_readme_with_llm(
     settings: Settings,
-    resolved_ctx: dict[str, Any],
+    parsed_ctx: dict[str, Any],
 ) -> EvaluationResult:
-    """Generate Portfolio, FlowCV Resume, LinkedIn Profile, and LinkedIn Post from `README.md`."""
-    user_prompt_lines = [
-        f"Suggested Project Slug ID: {resolved_ctx['default_slug']}",
-    ]
-    if resolved_ctx.get("project_name_hint"):
-        user_prompt_lines.append(f"Project Title Hint: {resolved_ctx['project_name_hint']}")
-    if resolved_ctx.get("repo_url"):
-        user_prompt_lines.append(f"Repository URL: {resolved_ctx['repo_url']}")
-    if resolved_ctx.get("live_demo_link"):
-        user_prompt_lines.append(f"Live Demo URL: {resolved_ctx['live_demo_link']}")
-    user_prompt_lines.append(f"\n--- PROJECT README.MD ---\n{resolved_ctx['readme_text']}")
-    user_prompt = "\n".join(user_prompt_lines)
+    """Analyze `README.md` content with `ChatOllama` and return a validated `EvaluationResult`."""
+    prompt_parts = [f"Suggested Project Slug ID: {parsed_ctx['default_slug']}"]
+    if parsed_ctx.get("source_code_link"):
+        prompt_parts.append(f"GitHub Source Link: {parsed_ctx['source_code_link']}")
+    if parsed_ctx.get("live_demo_link"):
+        prompt_parts.append(f"Live Demo URL: {parsed_ctx['live_demo_link']}")
+    prompt_parts.append(f"\n--- PROJECT README.MD CONTENT ---\n{parsed_ctx['readme_text']}")
 
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=user_prompt),
+        HumanMessage(content="\n".join(prompt_parts)),
     ]
 
     llm = build_chat_model(settings)
-    model_label = getattr(llm, "model", settings.ollama_model)
     logger.info(
-        "[Stage 1/4] Analyzing README.md (%d chars) with %s...",
-        len(resolved_ctx["readme_text"]),
-        model_label,
+        "[Stage 1/4] Analyzing README.md content (%d chars) with Ollama model %r...",
+        len(parsed_ctx["readme_text"]),
+        settings.ollama_model,
     )
     t0 = time.monotonic()
 
-    try:
-        structured_llm = llm.with_structured_output(
-            LLMEvaluationSchema,
-            method="json_schema",
-        )
-        llm_output: LLMEvaluationSchema = structured_llm.invoke(messages)
-    except Exception as schema_err:
-        if "not found" in str(schema_err).lower():
-            raise
-        logger.info("Falling back to `json_mode` structured output (%s)", schema_err)
-        structured_llm = llm.with_structured_output(
-            LLMEvaluationSchema,
-            method="json_mode",
-        )
-        llm_output = structured_llm.invoke(messages)
+    structured_llm = llm.with_structured_output(
+        LLMEvaluationSchema,
+        method="json_schema",
+    )
+    llm_output: LLMEvaluationSchema = structured_llm.invoke(messages)
 
-    elapsed = time.monotonic() - t0
     logger.info(
         "[Stage 1/4] Completed README analysis in %.1fs -> %r (id=%s)",
-        elapsed,
+        time.monotonic() - t0,
         llm_output.project_name,
         llm_output.id,
     )
 
     data = llm_output.model_dump()
-    if resolved_ctx.get("project_name_hint"):
-        data["project_name"] = resolved_ctx["project_name_hint"]
     if not data.get("id") or data.get("id") == "project":
         data["id"] = (
-            resolved_ctx["default_slug"]
-            if resolved_ctx["default_slug"] != "project"
+            parsed_ctx["default_slug"]
+            if parsed_ctx["default_slug"] != "project"
             else slugify_id(data["project_name"])
         )
 
     result = EvaluationResult.model_validate(data)
-    result.repo_url = resolved_ctx.get("repo_url")
-    result.source_code_link = resolved_ctx.get("source_code_link")
-    result.live_demo_link = resolved_ctx.get("live_demo_link")
+    result.source_code_link = parsed_ctx.get("source_code_link")
+    result.live_demo_link = parsed_ctx.get("live_demo_link")
     result.evaluated_at = datetime.now(timezone.utc).isoformat()
     return result
 
 
-def commit_and_push_portfolio_update(
+# ============================================================================
+# Section 3: Portfolio Git Updater & Executive Brief Builder
+# ============================================================================
+
+
+def sync_portfolio_repository(
     settings: Settings,
     result: EvaluationResult,
 ) -> dict[str, Any]:
-    """Clone the React portfolio repo, surgically upsert `projects.js`, commit, and push."""
+    """Clone the React portfolio repo, update `projects.js`, commit, and push to GitHub."""
     if not settings.portfolio_repo_url:
         return {
             "status": "skipped",
             "detail": "PORTFOLIO_REPO_URL is not configured in .env.",
         }
 
-    clean_port_url = validate_and_clean_repo_url(
-        settings.portfolio_repo_url, settings.allowed_git_hosts
-    )
-    if result.repo_url and normalize_repo_url(clean_port_url) == normalize_repo_url(result.repo_url):
-        return {
-            "status": "skipped_self",
-            "detail": "Target README belongs to PORTFOLIO_REPO_URL itself; skipped self-push.",
-        }
-
+    clean_port_url = clean_github_https_url(settings.portfolio_repo_url)
     job_dir = settings.temp_root_dir / f"portfolio_{uuid.uuid4().hex[:8]}"
-    auth_port_url = build_authenticated_git_url(clean_port_url, settings.github_pat)
+    auth_port_url = (
+        clean_port_url.replace("https://", f"https://x-access-token:{settings.github_pat}@", 1)
+        if settings.github_pat
+        else clean_port_url
+    )
 
     with _PORTFOLIO_LOCK:
         p_repo: Optional[git.Repo] = None
         try:
             job_dir.mkdir(parents=True, exist_ok=True)
             logger.info("[Stage 2/4] Updating React portfolio repository %s...", clean_port_url)
+
             clone_kwargs: dict[str, Any] = {"depth": 1}
             if settings.portfolio_branch:
                 clone_kwargs["branch"] = settings.portfolio_branch
@@ -548,28 +286,42 @@ def commit_and_push_portfolio_update(
             p_repo.git.add(A=True)
             if not p_repo.is_dirty(untracked_files=True):
                 return {
-                    "status": "unchanged",
+                    "status": "up_to_date",
                     "file": rel_target,
-                    "detail": f"Entry `{result.id}` in `{rel_target}` was already identical.",
+                    "detail": f"Entry `{result.id}` in `{rel_target}` was already up-to-date.",
                 }
 
             commit_msg = f"docs(portfolio): dynamic {action} for {result.project_name}"
             commit_obj = p_repo.index.commit(commit_msg)
-            p_repo.remotes.origin.push()
-            logger.info("[Stage 2/4] Pushed %s to %s (%s)", action, rel_target, commit_obj.hexsha[:8])
+
+            try:
+                p_repo.remotes.origin.push()
+            except git.GitCommandError as push_err:
+                if settings.github_pat and ("403" in str(push_err) or "401" in str(push_err)):
+                    logger.warning(
+                        "GITHUB_PAT returned 403; retrying push with Windows Git Credential Manager..."
+                    )
+                    p_repo.remotes.origin.set_url(clean_port_url)
+                    p_repo.remotes.origin.push()
+                else:
+                    raise
+
+            logger.info(
+                "[Stage 2/4] Pushed %s to %s (%s)", action, rel_target, commit_obj.hexsha[:8]
+            )
             return {
-                "status": action,
+                "status": "pushed",
+                "action": action,
                 "file": rel_target,
                 "commit_sha": commit_obj.hexsha[:8],
                 "detail": f"Committed `{commit_msg}` and pushed to `{clean_port_url}`.",
             }
         except Exception as exc:
-            safe_err = sanitize_secret(str(exc), settings.github_pat)
+            safe_err = (
+                str(exc).replace(settings.github_pat, "***") if settings.github_pat else str(exc)
+            )
             logger.error("[Stage 2/4] Portfolio update failed: %s", safe_err)
-            return {
-                "status": "failed",
-                "detail": safe_err,
-            }
+            return {"status": "failed", "detail": safe_err}
         finally:
             if p_repo is not None:
                 p_repo.close()
@@ -580,7 +332,7 @@ def build_executive_brief(
     result: EvaluationResult,
     actions: dict[str, dict[str, Any]],
 ) -> str:
-    """Format a clean Markdown Executive Brief summarizing actions taken & generated content."""
+    """Create a readable Markdown summary of completed actions and generated content."""
     port_act = actions["portfolio"]
     li_post_act = actions["linkedin_post"]
 
@@ -655,9 +407,8 @@ def persist_generation_and_brief(
 
         history = [item for item in history if item.get("id") != result.id]
         history.insert(0, payload_dict)
-        history = history[: settings.max_history_items]
         history_path.write_text(
-            json.dumps(history, indent=2, ensure_ascii=False) + "\n",
+            json.dumps(history[:30], indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
         return latest_json, latest_brief
@@ -667,32 +418,26 @@ def execute_release_pipeline(
     req: AnalyzeRequest,
     settings: Optional[Settings] = None,
 ) -> AnalyzeResponse:
-    """Run the complete synchronous README -> Portfolio + LinkedIn Post + Resume/Profile Brief flow."""
+    """Orchestrate the full README Content -> Portfolio + LinkedIn Post + Brief pipeline."""
     cfg = settings or Settings.from_env()
 
-    # Stage 1: Resolve README & generate all 4 career channels with LLM
-    resolved_ctx = resolve_readme_input(req, cfg)
-    result = evaluate_readme_with_llm(cfg, resolved_ctx)
+    # Stage 1: Parse README.md content and evaluate with Ollama
+    parsed_ctx = parse_readme_content(req, cfg)
+    result = evaluate_readme_with_llm(cfg, parsed_ctx)
 
-    # Stage 2: Update & push React Portfolio (`projects.js`)
+    # Stage 2: Commit & push update to React Portfolio repo
     if req.update_portfolio:
-        portfolio_action = commit_and_push_portfolio_update(cfg, result)
+        portfolio_action = sync_portfolio_repository(cfg, result)
     else:
-        portfolio_action = {
-            "status": "skipped",
-            "detail": "`update_portfolio=false` requested (dry-run).",
-        }
+        portfolio_action = {"status": "skipped", "detail": "Skipped (dry-run)."}
     result.portfolio_status = portfolio_action["status"]
 
-    # Stage 3: Publish LinkedIn Feed Post automatically via Official LinkedIn API
+    # Stage 3: Publish LinkedIn Feed Post via LinkedIn API
     if req.post_to_linkedin:
         logger.info("[Stage 3/4] Publishing launch post to LinkedIn API...")
         linkedin_action = publish_linkedin_feed_post(cfg, result)
     else:
-        linkedin_action = {
-            "status": "skipped",
-            "detail": "`post_to_linkedin=false` requested (dry-run).",
-        }
+        linkedin_action = {"status": "skipped", "detail": "Skipped (dry-run)."}
     result.linkedin_post_url = linkedin_action.get("post_url")
 
     actions: dict[str, dict[str, Any]] = {
@@ -701,16 +446,14 @@ def execute_release_pipeline(
         "resume_flowcv": {
             "status": "ready",
             "command": r".\.venv\Scripts\python.exe desktop_agent.py --flowcv --step",
-            "detail": f"{len(result.flowcv_format)} ATS action-verb bullets ready to paste.",
         },
         "linkedin_profile_project": {
             "status": "ready",
             "command": r".\.venv\Scripts\python.exe desktop_agent.py --linkedin --step",
-            "detail": "1st-person narrative & stack ready for LinkedIn Profile -> Projects.",
         },
     }
 
-    # Stage 4: Build Executive Brief & persist artifacts locally
+    # Stage 4: Save Executive Brief & JSON artifacts
     brief_md = build_executive_brief(result, actions)
     _, brief_path = persist_generation_and_brief(cfg, result, brief_md)
     logger.info("[Stage 4/4] Saved Executive Brief -> %s", brief_path)
@@ -726,133 +469,54 @@ def execute_release_pipeline(
     )
 
 
-def validate_webhook_credentials(
-    secret: str,
-    body_bytes: bytes,
-    authorization: Optional[str] = None,
-    x_hub_token: Optional[str] = None,
-    x_hub_signature_256: Optional[str] = None,
-) -> bool:
-    if not secret:
-        return True
-
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.removeprefix("Bearer ").strip()
-        if hmac.compare_digest(token, secret):
-            return True
-
-    if x_hub_token and hmac.compare_digest(x_hub_token.strip(), secret):
-        return True
-
-    if x_hub_signature_256 and x_hub_signature_256.startswith("sha256="):
-        expected = "sha256=" + hmac.new(
-            secret.encode("utf-8"), body_bytes, hashlib.sha256
-        ).hexdigest()
-        if hmac.compare_digest(expected, x_hub_signature_256.strip()):
-            return True
-
-    return False
-
-
-async def verify_webhook_auth(
-    request: FastAPIRequest,
-    authorization: Optional[str] = Header(default=None),
-    x_hub_token: Optional[str] = Header(default=None),
-    x_hub_signature_256: Optional[str] = Header(default=None),
-) -> None:
-    settings = Settings.from_env()
-    if not settings.webhook_secret:
-        return
-
-    # Allow direct local browser / Swagger UI requests (`127.0.0.1` / `::1`) when not
-    # proxied through an external tunnel and when no explicit auth header is being tested
-    client_host = (request.client.host if request.client else "").lower()
-    is_proxied = any(
-        h in request.headers
-        for h in ("x-forwarded-for", "cf-connecting-ip", "x-real-ip")
-    )
-    has_auth_header = bool(authorization or x_hub_token or x_hub_signature_256)
-    if client_host in {"127.0.0.1", "::1", "localhost"} and not is_proxied and not has_auth_header:
-        return
-
-    body = await request.body() if x_hub_signature_256 else b""
-    if not validate_webhook_credentials(
-        secret=settings.webhook_secret,
-        body_bytes=body,
-        authorization=authorization,
-        x_hub_token=x_hub_token,
-        x_hub_signature_256=x_hub_signature_256,
-    ):
-        raise HTTPException(status_code=401, detail="Invalid or missing webhook credentials.")
+# ============================================================================
+# Section 4: FastAPI HTTP Endpoints
+# ============================================================================
 
 
 @app.get("/health")
 def health_check() -> dict[str, Any]:
     settings = Settings.from_env()
     latest_file = settings.data_dir / "latest_generation.json"
-    installed_ollama = (
-        list_installed_ollama_chat_models(settings.ollama_base_url)
-        if settings.llm_provider not in {"gemini", "google", "google_genai"}
-        else None
-    )
-    active_model = (
-        settings.gemini_model
-        if settings.llm_provider in {"gemini", "google", "google_genai"}
-        else settings.ollama_model
-    )
     return {
         "status": "ok",
-        "mode": "readme_release_pipeline",
-        "llm_provider": settings.llm_provider,
-        "llm_model": active_model,
-        "installed_ollama_models": installed_ollama,
+        "ollama_model": settings.ollama_model,
+        "ollama_base_url": settings.ollama_base_url,
         "portfolio_configured": bool(settings.portfolio_repo_url),
         "linkedin_api_configured": bool(settings.linkedin_access_token),
         "has_latest_generation": latest_file.is_file(),
-        "auth_enabled": bool(settings.webhook_secret),
     }
 
 
-@app.post("/analyze", response_model=AnalyzeResponse, dependencies=[Depends(verify_webhook_auth)])
+@app.post("/analyze", response_model=AnalyzeResponse)
 def handle_analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
-    """Analyze a project `README.md`, update Portfolio + LinkedIn Post, and return the Brief."""
+    """Analyze `README.md` content (JSON body), update Portfolio + LinkedIn, and return Brief."""
     try:
         return execute_release_pipeline(payload)
-    except (ValueError, FileNotFoundError) as bad_req:
+    except ValueError as bad_req:
         raise HTTPException(status_code=400, detail=str(bad_req)) from bad_req
     except Exception as err:
         logger.exception("Release pipeline error")
         raise HTTPException(status_code=500, detail=str(err)) from err
 
 
-@app.post(
-    "/analyze/raw",
-    response_model=AnalyzeResponse,
-    dependencies=[Depends(verify_webhook_auth)],
-)
-async def handle_analyze_raw_markdown(
-    request: FastAPIRequest,
-    readme_path: Optional[str] = Query(
-        default=None,
-        description="Local path to README.md (e.g. C:\\Users\\...\\README.md)",
+@app.post("/analyze/raw", response_model=AnalyzeResponse)
+def handle_analyze_raw_markdown(
+    readme_content: str = Body(
+        ...,
+        media_type="text/plain",
+        description="Paste your full README.md content directly here as plain text.",
     ),
-    repo_url: Optional[str] = Query(
-        default=None,
-        description="GitHub repo URL (or local README.md path)",
+    is_private: bool = Query(
+        default=False,
+        description="Set true for private projects so source_code_link is omitted.",
     ),
-    live_demo_link: Optional[str] = Query(default=None),
-    is_private: Optional[bool] = Query(default=None),
     update_portfolio: bool = Query(default=True),
     post_to_linkedin: bool = Query(default=True),
 ) -> AnalyzeResponse:
-    """Upload raw `README.md` bytes or pass `readme_path` / `repo_url` query params."""
-    raw_bytes = await request.body()
-    readme_md = raw_bytes.decode("utf-8", errors="replace").strip() or None
+    """Paste raw `README.md` Markdown text directly into the request body (ideal for Swagger UI)."""
     req = AnalyzeRequest(
-        readme_content=readme_md,
-        readme_path=readme_path,
-        repo_url=repo_url,
-        live_demo_link=live_demo_link,
+        readme_content=readme_content,
         is_private=is_private,
         update_portfolio=update_portfolio,
         post_to_linkedin=post_to_linkedin,
@@ -860,9 +524,9 @@ async def handle_analyze_raw_markdown(
     return handle_analyze(req)
 
 
-@app.get("/brief", response_class=PlainTextResponse, dependencies=[Depends(verify_webhook_auth)])
+@app.get("/brief", response_class=PlainTextResponse)
 def get_latest_brief() -> str:
-    """Return the latest Markdown Executive Brief as plain text."""
+    """Return the latest Markdown Executive Brief."""
     settings = Settings.from_env()
     brief_path = settings.data_dir / "latest_brief.md"
     if not brief_path.is_file():
@@ -870,8 +534,9 @@ def get_latest_brief() -> str:
     return brief_path.read_text(encoding="utf-8")
 
 
-@app.get("/latest", dependencies=[Depends(verify_webhook_auth)])
+@app.get("/latest")
 def get_latest_generation() -> dict[str, Any]:
+    """Return the latest generated JSON payload."""
     settings = Settings.from_env()
     latest_path = settings.data_dir / "latest_generation.json"
     if not latest_path.is_file():
@@ -879,8 +544,9 @@ def get_latest_generation() -> dict[str, Any]:
     return json.loads(latest_path.read_text(encoding="utf-8"))
 
 
-@app.get("/history", dependencies=[Depends(verify_webhook_auth)])
+@app.get("/history")
 def get_generation_history() -> list[dict[str, Any]]:
+    """Return the history of evaluated projects."""
     settings = Settings.from_env()
     history_path = settings.data_dir / "history.json"
     if not history_path.is_file():
@@ -892,4 +558,4 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", "8000"))
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("server:app", host="127.0.0.1", port=port, reload=False)

@@ -497,7 +497,7 @@ def _merge_existing_js_props(
 def _find_matching_js_entry(
     entries: list[ParsedJSProjectSpan], result: EvaluationResult
 ) -> Optional[ParsedJSProjectSpan]:
-    target_repo = normalize_repo_url(result.repo_url or result.source_code_link)
+    target_repo = normalize_repo_url(result.source_code_link)
     target_id = slugify_id(result.id if result.id != "project" else result.project_name)
     target_name = result.project_name.strip().lower()
 
@@ -553,7 +553,7 @@ def upsert_json_projects_content(source: str, result: EvaluationResult) -> tuple
         raise ValueError("Expected JSON array or `{\"projects\": [...]}` object.")
 
     new_entry = _order_portfolio_entry(result.to_portfolio_dict())
-    target_repo = normalize_repo_url(result.repo_url or result.source_code_link)
+    target_repo = normalize_repo_url(result.source_code_link)
     target_id = new_entry["id"]
     target_name = result.project_name.strip().lower()
 

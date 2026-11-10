@@ -1,14 +1,11 @@
-"""One-command CLI to submit a completed project's `README.md` to `/analyze`.
+"""CLI to read a `README.md` file's content and submit it to `/analyze`.
 
 Examples:
-  # Submit a local README.md (auto-detects GitHub repo URL from .git/config if inside repo!)
+  # Read README.md content and run full release pipeline (Portfolio + LinkedIn + Brief)
   python publish.py --readme C:\\path\\to\\project\\README.md
 
-  # Submit with explicit GitHub repo & live Vercel URL
-  python publish.py --readme .\\README.md --repo-url https://github.com/manojkumar2291/vibe --demo https://vibe.vercel.app
-
-  # Fetch README.md directly from GitHub API without needing local files
-  python publish.py --repo-url https://github.com/manojkumar2291/vibe
+  # Retry pushing the already-generated `data/latest_generation.json` to your React portfolio
+  python publish.py --push-only
 
   # Dry-run preview (generates brief & copy without pushing to GitHub or posting to LinkedIn)
   python publish.py --readme .\\README.md --dry-run
@@ -26,15 +23,20 @@ from urllib.request import Request, urlopen
 
 from config import Settings
 import desktop_agent
-from models import AnalyzeRequest
+from models import AnalyzeRequest, EvaluationResult
 import server
 
 
-def _post_to_running_hub(
+# ============================================================================
+# Section 1: HTTP Client Helper (`POST /analyze`)
+# ============================================================================
+
+
+def post_to_running_hub(
     settings: Settings,
     req_model: AnalyzeRequest,
 ) -> Optional[dict[str, Any]]:
-    """Send `req_model` to running FastAPI `POST /analyze` if reachable; else return None."""
+    """Send `req_model` (`readme_content`) to a running FastAPI `POST /analyze` server."""
     if not settings.hub_server_url:
         return None
 
@@ -43,49 +45,38 @@ def _post_to_running_hub(
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    if settings.webhook_secret:
-        headers["Authorization"] = f"Bearer {settings.webhook_secret}"
-
     body = json.dumps(req_model.model_dump(), ensure_ascii=False).encode("utf-8")
     http_req = Request(url, data=body, headers=headers, method="POST")
+
     try:
         with urlopen(http_req, timeout=300) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except HTTPError as http_err:
         err_detail = http_err.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"FastAPI /analyze returned HTTP {http_err.code}: {err_detail}") from http_err
+        raise RuntimeError(
+            f"FastAPI /analyze returned HTTP {http_err.code}: {err_detail}"
+        ) from http_err
     except (URLError, ConnectionError, OSError):
-        # FastAPI server is not running locally; fall back to direct in-process execution!
         return None
+
+
+# ============================================================================
+# Section 2: CLI Arguments & Execution
+# ============================================================================
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="publish.py",
         description=(
-            "Analyze a completed project's README.md, auto-update your React portfolio, "
+            "Read a completed project's README.md content, auto-update your React portfolio, "
             "auto-publish a LinkedIn post, and output a complete Executive Brief."
         ),
     )
     parser.add_argument(
         "--readme",
         default=None,
-        help="Path to the completed project's README.md (or project folder).",
-    )
-    parser.add_argument(
-        "--repo-url",
-        default=None,
-        help="GitHub repository URL (optional if `--readme` is inside a git repo; or pass alone to fetch README from GitHub).",
-    )
-    parser.add_argument(
-        "--name",
-        default=None,
-        help="Optional explicit project display name override.",
-    )
-    parser.add_argument(
-        "--demo",
-        default=None,
-        help="Optional live demo URL (e.g. https://my-app.vercel.app).",
+        help="Path to the completed project's README.md file (or folder containing README.md).",
     )
     parser.add_argument(
         "--private",
@@ -113,6 +104,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run pipeline directly in this process instead of calling HUB_SERVER_URL/analyze.",
     )
     parser.add_argument(
+        "--push-only",
+        action="store_true",
+        help="Push the existing `data/latest_generation.json` to your React portfolio without re-running Ollama.",
+    )
+    parser.add_argument(
         "--paste",
         action="store_true",
         help="Immediately launch interactive FlowCV & LinkedIn Profile paste steps after brief.",
@@ -125,31 +121,44 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     settings = Settings.from_env()
 
-    if not args.readme and not args.repo_url:
-        parser.error("Provide `--readme <path/to/README.md>` and/or `--repo-url <https://github.com/...>`.")
-
-    readme_path_str: Optional[str] = None
-    if args.readme:
-        readme_path_str = str(Path(args.readme).expanduser().resolve())
-
-    update_portfolio = not (args.no_portfolio or args.dry_run)
-    post_to_linkedin = not (args.no_linkedin_post or args.dry_run)
-
-    req_model = AnalyzeRequest(
-        readme_path=readme_path_str,
-        repo_url=args.repo_url,
-        project_name_hint=args.name,
-        live_demo_link=args.demo,
-        is_private=True if args.private else None,
-        update_portfolio=update_portfolio,
-        post_to_linkedin=post_to_linkedin,
-    )
-
     try:
+        # Mode A: Push existing `latest_generation.json` directly to React portfolio
+        if args.push_only:
+            latest_file = settings.data_dir / "latest_generation.json"
+            if not latest_file.is_file():
+                parser.error(f"No `{latest_file}` found. Run `publish.py --readme ...` first.")
+            raw_data = json.loads(latest_file.read_text(encoding="utf-8"))
+            evaluation = EvaluationResult.model_validate(raw_data)
+            print(
+                f"Syncing `{evaluation.project_name}` (id: `{evaluation.id}`) to "
+                f"{settings.portfolio_repo_url} ..."
+            )
+            action = server.sync_portfolio_repository(settings, evaluation)
+            print(json.dumps(action, indent=2))
+            return 0 if action.get("status") in {"pushed", "up_to_date"} else 1
+
+        # Mode B: Read `README.md` content directly and analyze
+        if not args.readme:
+            parser.error("Provide `--readme <path/to/README.md>` or `--push-only`.")
+
+        readme_file = Path(args.readme).expanduser().resolve()
+        if readme_file.is_dir():
+            readme_file = readme_file / "README.md"
+        if not readme_file.is_file():
+            raise FileNotFoundError(f"README.md file not found: {readme_file}")
+
+        readme_content = readme_file.read_text(encoding="utf-8", errors="replace").strip()
+        req_model = AnalyzeRequest(
+            readme_content=readme_content,
+            is_private=bool(args.private),
+            update_portfolio=not (args.no_portfolio or args.dry_run),
+            post_to_linkedin=not (args.no_linkedin_post or args.dry_run),
+        )
+
         response_data: Optional[dict[str, Any]] = None
         if not args.direct:
-            print(f"Sending README analysis request to {settings.hub_server_url}/analyze ...")
-            response_data = _post_to_running_hub(settings, req_model)
+            print(f"Sending README.md content to {settings.hub_server_url}/analyze ...")
+            response_data = post_to_running_hub(settings, req_model)
 
         if response_data is None:
             if not args.direct:
@@ -177,4 +186,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
